@@ -1,3 +1,4 @@
+require "faraday"
 require "httparty"
 require "multi_json"
 require "base64"
@@ -28,13 +29,11 @@ module Sift
     #   a JSON object that can be decoded into status, message and request
     #   sections.
     #
-    def initialize(http_response, http_response_code, http_raw_response)
+    def initialize(http_response, http_response_code)
       @http_status_code = http_response_code
-      @http_raw_response = http_raw_response
 
       # only set these variables if a message-body is expected.
-      if not @http_raw_response.kind_of? Net::HTTPNoContent
-
+      if @http_status_code != 204
         begin
           @body = MultiJson.load(http_response) unless http_response.nil?
         rescue
@@ -65,15 +64,14 @@ module Sift
     # true on success; false otherwise
     #
     def ok?
-      if @http_raw_response.kind_of? Net::HTTPNoContent
+      if @http_status_code == 204
         #if there is no content expected, use HTTP code
         204 == @http_status_code
       else
         # otherwise use API status
-        @http_raw_response.kind_of? Net::HTTPOK and 0 == @api_status.to_i
+        @http_status_code == 200 && @api_status.to_i == 0
       end
     end
-
 
     # DEPRECATED
     # Getter method for deprecated 'json' member variable.
@@ -94,10 +92,14 @@ module Sift
     API_ENDPOINT = ENV["SIFT_RUBY_API_URL"] || 'https://api.siftscience.com'
     API3_ENDPOINT = ENV["SIFT_RUBY_API3_URL"] || 'https://api3.siftscience.com'
 
-    include HTTParty
-    base_uri API_ENDPOINT
+    # Connection
+    attr_accessor :options
 
+    # Sift Configuration
     attr_reader :api_key, :account_id
+
+    # Proxy Configuration
+    attr_reader :proxy_uri, :proxy_cert_file
 
     def self.build_auth_header(api_key)
       { "Authorization" => "Basic #{Base64.encode64(api_key)}" }
@@ -135,12 +137,25 @@ module Sift
     #     official path of the specified-version of the Events API.
     #
     #
-    def initialize(opts = {})
-      @api_key = opts[:api_key] || Sift.api_key
-      @account_id = opts[:account_id] || Sift.account_id
-      @version = opts[:version] || API_VERSION
-      @timeout = opts[:timeout] || 2  # 2-second timeout by default
-      @path = opts[:path] || Sift.rest_api_path(@version)
+    def initialize(options = {}, &block)
+      opts = options.dup
+      @api_key = opts.delete(:api_key) || Sift.api_key
+      @account_id = opts.delete(:account_id) || Sift.account_id
+      @version = opts.delete(:version) || API_VERSION
+      @timeout = opts.delete(:timeout) || 2  # 2-second timeout by default
+      @path = opts.delete(:path) || Sift.rest_api_path(@version)
+      @raise_errors = opts.delete(:raise_errors) || false
+
+      # Proxy
+      @proxy_uri = opts.delete(:proxy_uri) || Sift.proxy_uri
+      @proxy_cert_file = opts.delete(:proxy_cert_file) || Sift.proxy_cert_file
+
+      @options = {
+        connection_opts: {},
+        connection_build: block,
+        max_redirects: 5,
+        raise_errors: @raise_errors,
+      }.merge(opts)
 
       raise("api_key") if !@api_key.is_a?(String) || @api_key.empty?
       raise("path must be a non-empty string") if !@path.is_a?(String) || @path.empty?
@@ -150,6 +165,19 @@ module Sift
       "SiftScience/v#{@version} sift-ruby/#{VERSION}"
     end
 
+    # The Faraday connection object
+    def connection
+      @connection ||=
+        Faraday.new(API_ENDPOINT, options[:connection_opts]) do |builder|
+          if options[:connection_build]
+            options[:connection_build].call(builder)
+          else
+            builder.request :url_encoded             # form-encode POST params
+            builder.adapter Faraday.default_adapter  # make requests with Net::HTTP
+          end
+          builder.headers['User-Agent'] = user_agent
+        end
+    end
 
     # Sends an event to the Sift Science Events API.
     #
@@ -208,7 +236,7 @@ module Sift
     # this method propagates the exception, otherwise, a Response object is
     # returned that captures the status message and status code.
     #
-    def track(event, properties = {}, opts = {})
+    def track(event, properties = {}, opts = {}, enable_proxy = false)
       api_key = opts[:api_key] || @api_key
       version = opts[:version] || @version
       path = opts[:path] || (version && Sift.rest_api_path(version)) || @path
@@ -230,16 +258,19 @@ module Sift
       query["force_workflow_run"] = "true" if force_workflow_run
       query["abuse_types"] = abuse_types.join(",") if abuse_types
 
-      options = {
-        :body => MultiJson.dump(delete_nils(properties).merge({"$type" => event,
-                                                               "$api_key" => api_key})),
-        :headers => {"User-Agent" => user_agent},
-        :query => query
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
+      # If proxy is enabled
+      if enable_proxy
+        raise("Proxy is not configured properly") unless proxy?
+        enable_proxy_configuration
+      end
 
-      response = self.class.post(path, options)
-      Response.new(response.body, response.code, response.response)
+      body = MultiJson.dump(delete_nils(properties).merge({ "$type" => event, "$api_key" => api_key }))
+
+      response = connection.post(path, body) do |req|
+        req.options.timeout = timeout unless timeout.nil?
+        req.params = query
+      end
+      Response.new(response.body, response.status)
     end
 
 
@@ -275,6 +306,8 @@ module Sift
     # A Response object containing a status code, status message, and,
     # if successful, the user's score(s).
     #
+    # @deprecated Use {#get_user_score} instead.
+    #
     def score(user_id, opts = {})
       abuse_types = opts[:abuse_types]
       api_key = opts[:api_key] || @api_key
@@ -287,15 +320,10 @@ module Sift
       query = {}
       query["api_key"] = api_key
       query["abuse_types"] = abuse_types.join(",") if abuse_types
+      # TODO: Apply timeout option
 
-      options = {
-        :headers => {"User-Agent" => user_agent},
-        :query => query
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
-      response = self.class.get(Sift.score_api_path(user_id, version), options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(Sift.score_api_path(user_id, version), query)
+      Response.new(response.body, response.status)
     end
 
 
@@ -344,14 +372,8 @@ module Sift
       query["api_key"] = api_key
       query["abuse_types"] = abuse_types.join(",") if abuse_types
 
-      options = {
-        :headers => {"User-Agent" => user_agent},
-        :query => query
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
-      response = self.class.get(Sift.user_score_api_path(user_id, @version), options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(Sift.user_score_api_path(user_id, @version), query)
+      Response.new(response.body, response.status)
     end
 
 
@@ -392,18 +414,13 @@ module Sift
       raise("user_id must be a non-empty string") if (!user_id.is_a? String) || user_id.to_s.empty?
       raise("Bad api_key parameter") if api_key.empty?
 
-      query = {}
-      query["api_key"] = api_key
+      query = { "api_key" => api_key }
       query["abuse_types"] = abuse_types.join(",") if abuse_types
 
-      options = {
-        :headers => {"User-Agent" => user_agent},
-        :query => query
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
-      response = self.class.post(Sift.user_score_api_path(user_id, @version), options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.post(Sift.user_score_api_path(user_id, @version)) do |req|
+        req.params = query
+      end
+      Response.new(response.body, response.status)
     end
 
 
@@ -490,18 +507,11 @@ module Sift
 
       raise("user_id must be a non-empty string") if (!user_id.is_a? String) || user_id.to_s.empty?
 
-      query = {}
-      query[:api_key] = api_key
+      query = { api_key: api_key }
       query[:abuse_type] = abuse_type if abuse_type
 
-      options = {
-        :headers => {},
-        :query => query
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
-      response = self.class.delete(Sift.users_label_api_path(user_id, version), options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.delete(Sift.users_label_api_path(user_id, version), query)
+      Response.new(response.body, response.status)
     end
 
 
@@ -531,15 +541,12 @@ module Sift
       api_key = opts[:api_key] || @api_key
       timeout = opts[:timeout] || @timeout
 
-      options = {
-        :headers => { "User-Agent" => user_agent },
-        :basic_auth => { :username => api_key, :password => "" }
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
       uri = API3_ENDPOINT + Sift.workflow_status_path(account_id, run_id)
-      response = self.class.get(uri, options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(uri) do |req|
+        req.headers[Faraday::Request::Authorization::KEY] = Faraday::Utils.basic_header_from(api_key, "")
+        req.options.timeout = timeout unless timeout.nil?
+      end
+      Response.new(response.body, response.status)
     end
 
 
@@ -569,15 +576,12 @@ module Sift
       api_key = opts[:api_key] || @api_key
       timeout = opts[:timeout] || @timeout
 
-      options = {
-        :headers => { "User-Agent" => user_agent },
-        :basic_auth => { :username => api_key, :password => "" }
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
       uri = API3_ENDPOINT + Sift.user_decisions_api_path(account_id, user_id)
-      response = self.class.get(uri, options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(uri) do |req|
+        req.headers[Faraday::Request::Authorization::KEY] = Faraday::Utils.basic_header_from(api_key, "")
+        req.options.timeout = timeout unless timeout.nil?
+      end
+      Response.new(response.body, response.status)
     end
 
 
@@ -607,15 +611,12 @@ module Sift
       api_key = opts[:api_key] || @api_key
       timeout = opts[:timeout] || @timeout
 
-      options = {
-        :headers => { "User-Agent" => user_agent },
-        :basic_auth => { :username => api_key, :password => "" }
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
       uri = API3_ENDPOINT + Sift.order_decisions_api_path(account_id, order_id)
-      response = self.class.get(uri, options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(uri) do |req|
+        req.headers[Faraday::Request::Authorization::KEY] = Faraday::Utils.basic_header_from(api_key, "")
+        req.options.timeout = timeout unless timeout.nil?
+      end
+      Response.new(response.body, response.status)
     end
 
     # Gets the decision status of a session.
@@ -647,15 +648,12 @@ module Sift
       api_key = opts[:api_key] || @api_key
       timeout = opts[:timeout] || @timeout
 
-      options = {
-        :headers => { "User-Agent" => user_agent },
-        :basic_auth => { :username => api_key, :password => "" }
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
       uri = API3_ENDPOINT + Sift.session_decisions_api_path(account_id, user_id, session_id)
-      response = self.class.get(uri, options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(uri) do |req|
+        req.headers[Faraday::Request::Authorization::KEY] = Faraday::Utils.basic_header_from(api_key, "")
+        req.options.timeout = timeout unless timeout.nil?
+      end
+      Response.new(response.body, response.status)
     end
 
     # Gets the decision status of a piece of content.
@@ -687,15 +685,12 @@ module Sift
       api_key = opts[:api_key] || @api_key
       timeout = opts[:timeout] || @timeout
 
-      options = {
-        :headers => { "User-Agent" => user_agent },
-        :basic_auth => { :username => api_key, :password => "" }
-      }
-      options.merge!(:timeout => timeout) unless timeout.nil?
-
       uri = API3_ENDPOINT + Sift.content_decisions_api_path(account_id, user_id, content_id)
-      response = self.class.get(uri, options)
-      Response.new(response.body, response.code, response.response)
+      response = connection.get(uri) do |req|
+        req.headers[Faraday::Request::Authorization::KEY] = Faraday::Utils.basic_header_from(api_key, "")
+        req.options.timeout = timeout unless timeout.nil?
+      end
+      Response.new(response.body, response.status)
     end
 
     def decisions(opts = {})
@@ -740,6 +735,19 @@ module Sift
           false
         end
       end
+    end
+
+    def proxy?
+      !proxy_uri.to_s.empty? && !proxy_cert_file.to_s.empty?
+    end
+
+    def enable_proxy_configuration
+      return nil unless proxy?
+
+      @options[:connection_opts] = options[:connection_opts].merge({
+        proxy: proxy_uri,
+        ssl: { ca_file: proxy_cert_file }
+      })
     end
   end
 end

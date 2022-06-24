@@ -26,6 +26,7 @@ Gem::Specification.new do |s|
   s.add_development_dependency "webmock", ">= 1.16.0", "< 2"
 
   # Gems that must be intalled for sift to work
+  s.add_dependency "faraday", [">= 0.17.3", "< 3.0"]
   s.add_dependency "httparty", ">= 0.11.0"
   s.add_dependency "multi_json", ">= 1.0"
 

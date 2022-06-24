@@ -66,6 +66,11 @@ module Sift
     attr_accessor :account_id
   end
 
+  # Proxy Configuration
+  class << self
+    attr_accessor :proxy_uri, :proxy_cert_file
+  end
+
   # Sets the Output logger to use within the client. This can be left uninitializaed
   # but is useful for debugging.
   def self.logger=(logger)
