@@ -317,12 +317,12 @@ module Sift
       raise("user_id must be a non-empty string") if (!user_id.is_a? String) || user_id.to_s.empty?
       raise("Bad api_key parameter") if api_key.empty?
 
-      query = {}
-      query["api_key"] = api_key
+      query = { "api_key": api_key }
       query["abuse_types"] = abuse_types.join(",") if abuse_types
-      # TODO: Apply timeout option
 
-      response = connection.get(Sift.score_api_path(user_id, version), query)
+      response = connection.get(Sift.score_api_path(user_id, version), query) do |req|
+        req.options.timeout = timeout unless timeout.nil?
+      end
       Response.new(response.body, response.status)
     end
 
@@ -368,11 +368,12 @@ module Sift
       raise("user_id must be a non-empty string") if (!user_id.is_a? String) || user_id.to_s.empty?
       raise("Bad api_key parameter") if api_key.empty?
 
-      query = {}
-      query["api_key"] = api_key
+      query = { "api_key": api_key }
       query["abuse_types"] = abuse_types.join(",") if abuse_types
 
-      response = connection.get(Sift.user_score_api_path(user_id, @version), query)
+      response = connection.get(Sift.user_score_api_path(user_id, @version), query) do |req|
+        req.options.timeout = timeout unless timeout.nil?
+      end
       Response.new(response.body, response.status)
     end
 
@@ -418,6 +419,7 @@ module Sift
       query["abuse_types"] = abuse_types.join(",") if abuse_types
 
       response = connection.post(Sift.user_score_api_path(user_id, @version)) do |req|
+        req.options.timeout = timeout unless timeout.nil?
         req.params = query
       end
       Response.new(response.body, response.status)
@@ -507,10 +509,12 @@ module Sift
 
       raise("user_id must be a non-empty string") if (!user_id.is_a? String) || user_id.to_s.empty?
 
-      query = { api_key: api_key }
+      query = { "api_key": api_key }
       query[:abuse_type] = abuse_type if abuse_type
 
-      response = connection.delete(Sift.users_label_api_path(user_id, version), query)
+      response = connection.delete(Sift.users_label_api_path(user_id, version), query) do |req|
+        req.options.timeout = timeout unless timeout.nil?
+      end
       Response.new(response.body, response.status)
     end
 
